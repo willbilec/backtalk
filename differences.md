@@ -658,6 +658,8 @@ Backtalk installs as `fyi.quin.backtalk`, so it installs next to Google's TalkBa
 
 Backtalk checks GitHub for new development builds and installs them when you tap its notification. For more information, see [Updates](README.md#updates).
 
+On phones and Wear OS watches, installing an update opens a progress dialog with a Cancel button. The download runs in a foreground service and continues when you leave the dialog or turn off the screen. Open its notification, or choose **Check for updates** again, to return to progress. You can cancel from the dialog or notification, and retry if the download fails. Once the APK has been handed to Android, use the system installation prompt to confirm or cancel installation. If Backtalk is in the background when confirmation is needed, its notification brings you back to confirm.
+
 ## Android TV
 
 ### Settings on the TV home screen
@@ -673,6 +675,8 @@ Settings for features that need a touchscreen or a phone are hidden on TVs, such
 ### Same settings as phones
 
 Watches show the same Backtalk settings as phones, including **Text-to-speech**, all of **Verbosity**, **Individual sounds and vibrations**, **Lift to activate**, **Turn off animations**, **Status readout**, the rotor, the reading controls, the delay settings, update checks, and the circle menu, which is scaled to fit the screen. Settings for features that watches don't support are hidden, such as the braille keyboard, keyboard shortcuts, voice commands, direct touch, on-device AI, **Speaker when away from your ear**, and **Resume Backtalk**.
+
+In **Advanced > Developer settings**, **Open Backtalk System Info** opens Android’s app-management screen for this Backtalk installation, including a separate test copy. This provides access when a watch manufacturer leaves accessibility services out of its app lists. The available controls depend on the device. The watch build supplies Backtalk’s icon for that screen without adding an app-drawer entry.
 
 ### Gestures on watches
 

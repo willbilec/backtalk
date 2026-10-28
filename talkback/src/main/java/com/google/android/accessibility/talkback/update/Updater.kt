@@ -26,7 +26,6 @@ import android.content.Intent
 import android.content.pm.PackageInfo
 import android.content.pm.PackageInstaller
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -47,8 +46,6 @@ import com.google.android.accessibility.utils.SharedPreferencesUtils
 import com.google.android.accessibility.utils.material.A11yAlertDialogWrapper
 import com.google.android.libraries.accessibility.utils.log.LogUtils
 import java.io.File
-import java.io.IOException
-import java.net.HttpURLConnection
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
@@ -169,6 +166,11 @@ object Updater {
   /** Checks now, and offers to install a newer build. */
   @JvmStatic
   fun checkManually(activity: Activity) {
+    val download = UpdateDownloadManager.get(activity)
+    if (download.state.active) {
+      activity.startActivity(UpdateDownloadActivity.intent(activity, download.url))
+      return
+    }
     val context = activity.applicationContext
     toast(context, R.string.update_checking)
     executor.execute {
@@ -230,12 +232,9 @@ object Updater {
   }
 
   private fun showNotification(context: Context, update: UpdateInfo) {
-    val intent =
-      Intent(context, UpdateReceiver::class.java)
-        .setAction(UpdateReceiver.ACTION_INSTALL)
-        .putExtra(UpdateReceiver.EXTRA_DOWNLOAD_URL, update.downloadUrl)
+    val intent = UpdateDownloadActivity.intent(context, update.downloadUrl, start = true)
     val pendingIntent =
-      PendingIntent.getBroadcast(
+      PendingIntent.getActivity(
         context,
         0,
         intent,
@@ -264,64 +263,13 @@ object Updater {
    */
   @JvmStatic
   fun install(context: Context, downloadUrl: String) {
-    val appContext = context.applicationContext
-    if (!appContext.packageManager.canRequestPackageInstalls()) {
-      val intent =
-        Intent(
-            Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-            Uri.parse("package:" + appContext.packageName),
-          )
-          .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-      try {
-        appContext.startActivity(intent)
-      } catch (e: ActivityNotFoundException) {
-        LogUtils.w(TAG, "Cannot open the install apps setting: %s", e)
-      }
-      mainHandler.postDelayed(
-        { toast(appContext, R.string.update_allow_install, Toast.LENGTH_LONG) },
-        TOAST_AFTER_SCREEN_DELAY_MS,
-      )
-      return
-    }
-    toast(appContext, R.string.update_downloading)
-    executor.execute {
-      try {
-        val apk = download(appContext, downloadUrl)
-        try {
-          installApk(appContext, apk)
-        } finally {
-          apk.delete()
-        }
-      } catch (e: WrongPackageException) {
-        LogUtils.e(TAG, "Refused the update: %s", e.message)
-        mainHandler.post { toast(appContext, R.string.update_wrong_package, Toast.LENGTH_LONG) }
-      } catch (e: Exception) {
-        LogUtils.e(TAG, "Cannot install the update: %s", e)
-        mainHandler.post { toast(appContext, R.string.update_install_failed) }
-      }
-    }
+    context.startActivity(UpdateDownloadActivity.intent(context, downloadUrl, start = true))
   }
 
-  private fun download(context: Context, url: String): File {
-    val directory = File(context.cacheDir, "update")
-    directory.mkdirs()
-    val file = File(directory, APK_FILE_NAME)
-    val connection = UpdateChecker.openConnection(context, url)
-    try {
-      val code = connection.responseCode
-      if (code != HttpURLConnection.HTTP_OK) {
-        throw IOException("Download returned HTTP $code")
-      }
-      connection.inputStream.use { input -> file.outputStream().use { input.copyTo(it) } }
-    } finally {
-      connection.disconnect()
-    }
-    return file
-  }
+  internal class WrongPackageException(message: String) : Exception(message)
 
-  private class WrongPackageException(message: String) : Exception(message)
-
-  private fun installApk(context: Context, apk: File) {
+  internal fun installApk(context: Context, apk: File, transfer: UpdateTransfer) {
+    transfer.checkActive()
     val info = readArchive(context, apk)
     val apkPackage = info?.packageName
     val kind = AppIdMove.installKind(apkPackage, context.packageName, isSameSigner(context, info))
@@ -345,7 +293,15 @@ object Updater {
     try {
       installer.openSession(sessionId).use { session ->
         session.openWrite(APK_FILE_NAME, 0, apk.length()).use { output ->
-          apk.inputStream().use { it.copyTo(output) }
+          apk.inputStream().use { input ->
+            val buffer = ByteArray(32 * 1024)
+            while (true) {
+              transfer.checkActive()
+              val count = input.read(buffer)
+              if (count == -1) break
+              output.write(buffer, 0, count)
+            }
+          }
           session.fsync(output)
         }
         val intent =
@@ -357,7 +313,7 @@ object Updater {
           PendingIntent.FLAG_UPDATE_CURRENT or
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_MUTABLE else 0
         val statusIntent = PendingIntent.getBroadcast(context, sessionId, intent, flags)
-        session.commit(statusIntent.intentSender)
+        transfer.commit { session.commit(statusIntent.intentSender) }
       }
     } catch (e: Exception) {
       installer.abandonSession(sessionId)
@@ -407,26 +363,32 @@ object Updater {
         val confirmIntent =
           IntentCompat.getParcelableExtra(intent, Intent.EXTRA_INTENT, Intent::class.java)
         if (confirmIntent == null) {
+          UpdateDownloadManager.get(context).installStatus(UpdateDownloadManager.Phase.FAILED)
+          UpdateDownloadService.showResult(context)
           toast(appContext, R.string.update_install_failed)
           return
         }
-        try {
-          appContext.startActivity(confirmIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-        } catch (e: ActivityNotFoundException) {
-          LogUtils.e(TAG, "Cannot open the install prompt: %s", e)
-          toast(appContext, R.string.update_install_failed)
-        }
+        UpdateDownloadManager.get(context).installStatus(UpdateDownloadManager.Phase.CONFIRM, confirmIntent)
+        UpdateDownloadService.showResult(context)
       }
       // For an update, the system stops Backtalk to replace it, and restarts the service if it
       // was on. A move installs a new app, and this one keeps running until that one is on.
       PackageInstaller.STATUS_SUCCESS -> {
+        UpdateDownloadManager.get(context).installStatus(UpdateDownloadManager.Phase.DONE)
+        UpdateDownloadService.showResult(context)
         val installed = intent.getStringExtra(UpdateReceiver.EXTRA_INSTALLED_PACKAGE)
         if (installed != null && installed != appContext.packageName) {
           onMoved(appContext, installed)
         }
       }
-      PackageInstaller.STATUS_FAILURE_ABORTED -> toast(appContext, R.string.update_install_canceled)
+      PackageInstaller.STATUS_FAILURE_ABORTED -> {
+        UpdateDownloadManager.get(context).installStatus(UpdateDownloadManager.Phase.CANCELED)
+        UpdateDownloadService.showResult(context)
+        toast(appContext, R.string.update_install_canceled)
+      }
       else -> {
+        UpdateDownloadManager.get(context).installStatus(UpdateDownloadManager.Phase.FAILED)
+        UpdateDownloadService.showResult(context)
         LogUtils.e(
           TAG,
           "Install failed with status %d: %s",
